@@ -22,6 +22,7 @@ RAG_CSV_PATH    = os.environ.get("RAG_CSV_PATH",    "rag_documents.csv")
 EMBEDDINGS_PATH = os.environ.get("EMBEDDINGS_PATH", "embeddings.npy")
 CHROMA_DIR      = os.environ.get("CHROMA_DIR",      "./chroma_db")
 COLLECTION_NAME = "anomaly_logs"
+NPY_PATH = os.environ.get("NPY_PATH", "embeddings.npy")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EVENT DESCRIPTIONS
