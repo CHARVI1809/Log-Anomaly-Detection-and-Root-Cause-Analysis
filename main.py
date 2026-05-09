@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import numpy as np
 import pandas as pd
 import chromadb
 from collections import Counter
@@ -23,6 +24,7 @@ RAG_CSV_PATH   = os.environ.get("RAG_CSV_PATH", "rag_documents.csv")
 CHROMA_DIR     = os.environ.get("CHROMA_DIR", "./chroma_db")
 EMBED_MODEL    = os.environ.get("EMBED_MODEL", "all-MiniLM-L6-v2")
 COLLECTION_NAME = "anomaly_logs"
+NPY_PATH = os.environ.get("NPY_PATH", "embeddings.npy")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EVENT DESCRIPTIONS
@@ -115,18 +117,19 @@ async def lifespan(app: FastAPI):
 
     all_metadata = [parse_metadata_from_doc(doc) for doc in documents]
 
-    print("[startup] Loading embedding model...")
+    print("[startup] Loading embedding model (lazy — skipping bulk encode)...")
     embed_model = SentenceTransformer(EMBED_MODEL)
 
-    print("[startup] Building ChromaDB index...")
-    chroma_client = chromadb.Client(chromadb.config.Settings(persist_directory=CHROMA_DIR))
+    print("[startup] Building ChromaDB index from pre-computed embeddings...")
+    chroma_client = chromadb.Client()   # in-memory only, no persist_directory
     try:
         chroma_client.delete_collection(name=COLLECTION_NAME)
     except Exception:
         pass
     collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
 
-    embeddings = embed_model.encode(documents, show_progress_bar=True, batch_size=64)
+    NPY_PATH = os.environ.get("NPY_PATH", "embeddings.npy")
+    embeddings = np.load(NPY_PATH)      # load pre-computed, ~5MB, instant
     BATCH = 500
     for start in range(0, len(documents), BATCH):
         end = min(start + BATCH, len(documents))
