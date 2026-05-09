@@ -6,10 +6,12 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: GROQ_API_KEY
         sync: false          # you fill this in Render dashboard
       - key: RAG_CSV_PATH
-        value: rag_documents.csv
+        value: results/rag_documents.csv
       - key: CHROMA_DIR
         value: ./chroma_db
       - key: EMBED_MODEL
