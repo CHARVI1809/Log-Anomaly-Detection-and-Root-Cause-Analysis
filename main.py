@@ -12,17 +12,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-
 from groq import Groq
-from sentence_transformers import SentenceTransformer
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIG  (all sensitive values come from Render environment variables)
+# CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
-RAG_CSV_PATH   = os.environ.get("RAG_CSV_PATH", "rag_documents.csv")
-CHROMA_DIR     = os.environ.get("CHROMA_DIR", "./chroma_db")
-EMBED_MODEL    = os.environ.get("EMBED_MODEL", "all-MiniLM-L6-v2")
+GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
+RAG_CSV_PATH    = os.environ.get("RAG_CSV_PATH",    "rag_documents.csv")
+EMBEDDINGS_PATH = os.environ.get("EMBEDDINGS_PATH", "embeddings.npy")
+CHROMA_DIR      = os.environ.get("CHROMA_DIR",      "./chroma_db")
 COLLECTION_NAME = "anomaly_logs"
 NPY_PATH = os.environ.get("NPY_PATH", "embeddings.npy")
 
@@ -33,14 +31,14 @@ EVENT_DESCRIPTIONS = {
     "E1":  "A DataNode received a request to store a block that already exists — duplicate write or stale reference.",
     "E2":  "Block checksum verification passed — data written is confirmed intact.",
     "E3":  "A DataNode successfully served a block read request.",
-    "E4":  "An exception occurred while a DataNode was serving a block — read or transfer failed.",
-    "E5":  "A DataNode started receiving a new block — normal start of a pipeline write.",
-    "E6":  "A DataNode finished receiving a full block — confirms complete transfer.",
-    "E7":  "An exception was thrown during a block write operation — write pipeline error.",
+    "E4":  "An exception occurred while serving a block — read or transfer failed.",
+    "E5":  "A DataNode started receiving a new block — start of a pipeline write.",
+    "E6":  "A DataNode finished receiving a full block — complete transfer confirmed.",
+    "E7":  "An exception was thrown during a block write operation.",
     "E8":  "The PacketResponder thread was interrupted — unexpected pipeline disruption.",
     "E9":  "A DataNode finished receiving a block of a known size — successful replica receipt.",
-    "E10": "The PacketResponder thread threw an unhandled exception — serious acknowledgement loop error.",
-    "E11": "The PacketResponder thread for a block terminated — normal end or abnormal failure.",
+    "E10": "The PacketResponder thread threw an unhandled exception.",
+    "E11": "The PacketResponder thread for a block terminated — normal end or failure.",
     "E12": "Exception while writing block to a mirror DataNode — replication pipeline failed.",
     "E13": "DataNode received an empty packet — heartbeat or end-of-stream signal.",
     "E14": "Exception inside receiveBlock handler — block write could not complete.",
@@ -49,7 +47,7 @@ EVENT_DESCRIPTIONS = {
     "E17": "Block transfer to target DataNode failed — re-replication unsuccessful.",
     "E18": "NameNode instructed DataNode to start background block copy thread.",
     "E19": "Block file reopened for appending.",
-    "E20": "Delete failed — block metadata not found in DataNode volume map, orphaned block.",
+    "E20": "Delete failed — block metadata not found in DataNode volume map (orphaned block).",
     "E21": "DataNode deleted a block file from local disk — triggered by NameNode invalidation.",
     "E22": "NameNode allocated a new block ID — start of new block creation.",
     "E23": "NameNode added block to invalidation set — scheduled for deletion.",
@@ -71,7 +69,7 @@ FALLBACK_MITIGATIONS = {
     },
     "repetition": {
         "high":   ["Inspect DataNode for stuck PacketResponder thread and restart if confirmed.",
-                   "Check for network packet loss between pipeline DataNodes causing repeated events."],
+                   "Check for network packet loss between pipeline DataNodes."],
         "medium": ["Review NameNode RPC logs for timeout patterns triggering re-sends.",
                    "Verify DataNode JVM heap — GC pauses can stall pipeline and trigger retries."],
         "low":    ["Increase pipeline write timeout thresholds to reduce false retry triggers."],
@@ -93,22 +91,25 @@ FALLBACK_MITIGATIONS = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GLOBALS (populated at startup)
+# GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
-documents     = []
-all_metadata  = []
-block_lookup  = {}
-embed_model   = None
-collection    = None
-groq_client   = None
+documents    = []
+all_metadata = []
+block_lookup = {}
+collection   = None
+groq_client  = None
+# ONNX session for query-time embedding (tiny memory vs full torch)
+onnx_session     = None
+tokenizer        = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STARTUP  — load data, build embeddings, index ChromaDB
+# STARTUP
 # ─────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global documents, all_metadata, block_lookup, embed_model, collection, groq_client
+    global documents, all_metadata, block_lookup, collection, groq_client
+    global onnx_session, tokenizer
 
     print("[startup] Loading RAG documents...")
     rag_df    = pd.read_csv(RAG_CSV_PATH)
@@ -117,19 +118,18 @@ async def lifespan(app: FastAPI):
 
     all_metadata = [parse_metadata_from_doc(doc) for doc in documents]
 
-    print("[startup] Loading embedding model (lazy — skipping bulk encode)...")
-    embed_model = SentenceTransformer(EMBED_MODEL)
+    print("[startup] Loading pre-computed embeddings...")
+    embeddings = np.load(EMBEDDINGS_PATH).astype("float32")
+    print(f"[startup] Embeddings shape: {embeddings.shape}")
 
-    print("[startup] Building ChromaDB index from pre-computed embeddings...")
-    chroma_client = chromadb.Client()   # in-memory only, no persist_directory
+    print("[startup] Building ChromaDB index (in-memory)...")
+    chroma_client = chromadb.EphemeralClient()   # no disk — saves memory
     try:
         chroma_client.delete_collection(name=COLLECTION_NAME)
     except Exception:
         pass
-    collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+    collection = chroma_client.create_collection(name=COLLECTION_NAME)
 
-    NPY_PATH = os.environ.get("NPY_PATH", "embeddings.npy")
-    embeddings = np.load(NPY_PATH)      # load pre-computed, ~5MB, instant
     BATCH = 500
     for start in range(0, len(documents), BATCH):
         end = min(start + BATCH, len(documents))
@@ -141,6 +141,16 @@ async def lifespan(app: FastAPI):
         )
     print(f"[startup] Indexed {collection.count()} vectors.")
 
+    # Load ONNX model for query embedding — ~80MB vs ~300MB for torch
+    print("[startup] Loading ONNX embedding model...")
+    from optimum.onnxruntime import ORTModelForFeatureExtraction
+    from transformers import AutoTokenizer
+    tokenizer    = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+    onnx_session = ORTModelForFeatureExtraction.from_pretrained(
+        "sentence-transformers/all-MiniLM-L6-v2", export=True
+    )
+    print("[startup] ONNX model ready.")
+
     block_lookup = {
         m["block_id"]: (documents[i], m)
         for i, m in enumerate(all_metadata)
@@ -149,7 +159,7 @@ async def lifespan(app: FastAPI):
     groq_client = Groq(api_key=GROQ_API_KEY)
     print("[startup] Ready.")
     yield
-    print("[shutdown] Goodbye.")
+    print("[shutdown] Done.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,7 +167,6 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_metadata_from_doc(doc: str) -> dict:
     block_id_m = re.search(r"Block ID\s*:\s*(\S+)", doc)
-    label_m    = re.search(r"^Label\s*:\s*(.+)", doc, re.MULTILINE)
     atypes_m   = re.search(r"Anomaly Type\(s\)\s*:\s*(.+)", doc)
     latency_m  = re.search(r"Latency\s*:\s*(\d+)", doc)
     total_m    = re.search(r"Total Events\s*:\s*(\d+)", doc)
@@ -165,15 +174,29 @@ def parse_metadata_from_doc(doc: str) -> dict:
     primary_type = full_types.split(",")[0].strip()
     return {
         "block_id":      block_id_m.group(1).strip() if block_id_m else "unknown",
-        "label":         label_m.group(1).strip()    if label_m    else "Fail",
         "anomaly_types": full_types,
         "primary_type":  primary_type,
-        "latency":       int(latency_m.group(1))     if latency_m  else 0,
-        "total_events":  int(total_m.group(1))       if total_m    else 0,
+        "latency":       int(latency_m.group(1)) if latency_m else 0,
+        "total_events":  int(total_m.group(1))   if total_m   else 0,
     }
 
 
-def compress_historical_case(doc: str, block_id: str, latency: int, distance: float) -> str:
+def embed_query(text: str) -> list:
+    """Embed a single query string using ONNX — no torch required."""
+    import torch
+    inputs  = tokenizer(text, return_tensors="pt", truncation=True,
+                        max_length=256, padding=True)
+    outputs = onnx_session(**inputs)
+    # Mean pooling
+    token_embeddings = outputs.last_hidden_state
+    attention_mask   = inputs["attention_mask"]
+    mask_expanded    = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    pooled           = (token_embeddings * mask_expanded).sum(1) / mask_expanded.sum(1).clamp(min=1e-9)
+    vec              = torch.nn.functional.normalize(pooled, p=2, dim=1)
+    return vec.detach().numpy().tolist()
+
+
+def compress_historical_case(doc, block_id, latency, distance) -> str:
     seq_m   = re.search(r"Event Sequence\s*:\s*(.+)", doc)
     atype_m = re.search(r"Anomaly Type\(s\)\s*:\s*(.+)", doc)
     total_m = re.search(r"Total Events\s*:\s*(\d+)", doc)
@@ -188,25 +211,24 @@ def compress_historical_case(doc: str, block_id: str, latency: int, distance: fl
             f"Seq: {short}")
 
 
-def build_query_from_doc(doc: str, meta: dict) -> str:
-    seq_m     = re.search(r"Event Sequence\s*:\s*(.+)", doc)
-    event_seq = seq_m.group(1).strip() if seq_m else ""
-    return (f"HDFS block anomaly: {meta.get('anomaly_types','unknown')}. "
-            f"Latency: {meta.get('latency',0)}ms. "
-            f"Total events: {meta.get('total_events',0)}. "
-            f"Event sequence: {event_seq}")
+def build_query_from_doc(doc, meta) -> str:
+    seq_m = re.search(r"Event Sequence\s*:\s*(.+)", doc)
+    seq   = seq_m.group(1).strip() if seq_m else ""
+    return (f"HDFS anomaly: {meta.get('anomaly_types','?')}. "
+            f"Latency: {meta.get('latency',0)}ms. Events: {meta.get('total_events',0)}. "
+            f"Seq: {seq}")
 
 
-def build_event_context(doc: str) -> str:
+def build_event_context(doc) -> str:
     seq_m = re.search(r"Event Sequence\s*:\s*(.+)", doc)
     if not seq_m:
-        return "No event sequence found."
+        return "No event sequence."
     ids = list(dict.fromkeys(re.findall(r"E\d+", seq_m.group(1))))
-    return "\n".join(f"{eid}: {EVENT_DESCRIPTIONS.get(eid,'Unknown event')}" for eid in ids)
+    return "\n".join(f"{e}: {EVENT_DESCRIPTIONS.get(e,'Unknown')}" for e in ids)
 
 
-def retrieve_similar_anomalies(query: str, k: int = 3, anomaly_type_filter: str = None) -> list:
-    qemb  = embed_model.encode([query]).tolist()
+def retrieve_similar(query, k=3, anomaly_type_filter=None):
+    qemb  = embed_query(query)
     where = {"primary_type": {"$eq": anomaly_type_filter}} if anomaly_type_filter else None
     res   = collection.query(query_embeddings=qemb, n_results=k, where=where)
     return [
@@ -217,29 +239,13 @@ def retrieve_similar_anomalies(query: str, k: int = 3, anomaly_type_filter: str 
     ]
 
 
-def compute_confidence(similar_docs: list, query_doc: str, latency: int) -> tuple:
-    avg_dist = sum(d["distance"] for d in similar_docs) / len(similar_docs)
-    r_score  = 0.9 if avg_dist < 0.70 else (0.7 if avg_dist < 0.80 else 0.5)
-    ids      = re.findall(r"E\d+", query_doc)
-    counts   = Counter(ids)
-    rep_score = sum(v for v in counts.values() if v > 1) / max(len(ids), 1)
-    l_score  = 0.9 if latency > 20000 else (0.7 if latency > 8000 else 0.5)
-    conf     = round(min(max((r_score + rep_score + l_score) / 3, 0.0), 1.0), 2)
-    label    = "high" if conf >= 0.75 else ("medium" if conf >= 0.4 else "low")
-    return conf, label
-
-
 def repair_json(s: str) -> dict:
-    """Char-by-char JSON repair: handles trailing commas, unescaped inner quotes, truncation."""
     s = s.strip()
     s = re.sub(r"^```(?:json)?\s*", "", s)
     s = re.sub(r"\s*```$", "", s)
     s = re.sub(r",\s*([}\]])", r"\1", s)
     s = re.sub(r"(?<![\w])'([^']*)'(?![\w])", r'"\1"', s)
-
-    result    = []
-    in_string = False
-    i         = 0
+    result = []; in_string = False; i = 0
     while i < len(s):
         c = s[i]
         if c == "\\" and in_string:
@@ -252,38 +258,33 @@ def repair_json(s: str) -> dict:
             else:
                 rest   = s[i+1:].lstrip()
                 closes = (not rest) or rest[0] in (":", ",", "}", "]")
-                if closes or i == len(s) - 1:
+                if closes or i == len(s)-1:
                     in_string = False; result.append(c)
                 else:
                     result.append('\\"')
             i += 1; continue
         result.append(c); i += 1
-
     s = "".join(result)
     s = re.sub(r",\s*([}\]])", r"\1", s)
-
     try:
         return json.loads(s)
     except json.JSONDecodeError:
-        if in_string:
-            s += '"'
+        if in_string: s += '"'
         depth = []
         for ch in s:
-            if ch in ("{", "["):
-                depth.append("}" if ch == "{" else "]")
-            elif ch in ("}", "]") and depth:
-                depth.pop()
+            if ch in ("{","["): depth.append("}" if ch=="{" else "]")
+            elif ch in ("}","]") and depth: depth.pop()
         s += "".join(reversed(depth))
         s = re.sub(r",\s*([}\]])", r"\1", s)
         return json.loads(s)
 
 
-def generate_root_cause(query_doc: str, hist_ctx: str, query_meta: dict, similar_docs: list) -> dict:
+def generate_root_cause(query_doc, hist_ctx, query_meta, similar_docs) -> dict:
     total_events = query_meta.get("total_events", "?")
     latency_ms   = query_meta.get("latency", "?")
     event_ref    = build_event_context(query_doc)
 
-    user_prompt = f"""QUERY BLOCK:
+    prompt = f"""QUERY BLOCK:
 {query_doc}
 
 EVENT REFERENCE:
@@ -293,143 +294,101 @@ HISTORICAL CASES:
 {hist_ctx}
 
 Return JSON in EXACTLY this field order:
-
 {{
   "block_id": "{query_meta['block_id']}",
-  "anomaly_type": "copy first type from Anomaly Type(s) in QUERY BLOCK exactly",
+  "anomaly_type": "copy first type from Anomaly Type(s) exactly",
   "confidence": 0.85,
   "confidence_label": "high",
   "mitigation_steps": {{
-    "high": ["specific urgent action 1", "specific urgent action 2"],
-    "medium": ["important follow-up 1", "important follow-up 2"],
-    "low": ["longer-term improvement"]
+    "high": ["urgent action 1", "urgent action 2"],
+    "medium": ["follow-up 1", "follow-up 2"],
+    "low": ["improvement"]
   }},
-  "summary": "THIS BLOCK HAS {total_events} EVENTS AND {latency_ms}ms LATENCY. Write 1-2 sentences using these exact numbers.",
-  "root_cause": "mechanism first, then cite specific event IDs and repeat counts as evidence",
-  "comparison_to_historical": "exactly one sentence with one specific number — no raw dicts",
-  "event_explanations": {{
-    "E5": "copy from EVENT REFERENCE"
-  }}
+  "summary": "THIS BLOCK HAS {total_events} EVENTS AND {latency_ms}ms LATENCY. 1-2 sentences with these exact numbers.",
+  "root_cause": "mechanism first, then cite event IDs as evidence",
+  "comparison_to_historical": "one sentence with one specific number",
+  "event_explanations": {{"E5": "copy from EVENT REFERENCE"}}
 }}
 
-MANDATORY RULES:
-1. mitigation_steps.high   MUST have 2+ strings. Never [], never null.
-2. mitigation_steps.medium MUST have 2+ strings. Never [], never null.
-3. mitigation_steps.low    MUST have 1+ string.  Never [], never null.
-4. summary MUST include {total_events} and {latency_ms}ms.
-5. anomaly_type: copy first value from Anomaly Type(s) exactly.
-6. comparison_to_historical: 1 sentence only, no dicts.
-7. event_explanations: all unique events, copy from EVENT REFERENCE.
-8. DO NOT return anything except valid JSON.
-"""
+RULES: mitigation all tiers required. anomaly_type from QUERY BLOCK only. JSON only."""
 
     MAX_RETRIES = 3
-    response    = None
-    last_error  = None
-
+    response = None; last_error = None
     for attempt in range(MAX_RETRIES):
         try:
             response = groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
                     {"role": "system", "content": "You are an HDFS expert. Return ONLY valid JSON."},
-                    {"role": "user",   "content": user_prompt},
+                    {"role": "user",   "content": prompt},
                 ],
-                temperature=0.2,
-                max_tokens=1500,
+                temperature=0.2, max_tokens=1500,
             )
             break
-        except Exception as api_err:
-            last_error = api_err
-            err_str    = str(api_err)
-            if "413" in err_str and attempt < MAX_RETRIES - 1:
-                # Compress even further and retry
-                compressed = "\n\n".join([
+        except Exception as e:
+            last_error = e; es = str(e)
+            if "413" in es and attempt < MAX_RETRIES-1:
+                compressed = "\n".join(
                     f"Case {i+1}: {r['block_id']} | {r['primary_type']} | {r['latency']}ms"
                     for i, r in enumerate(similar_docs)
-                ])
-                user_prompt = user_prompt.replace(hist_ctx, compressed)
+                )
+                prompt = prompt.replace(hist_ctx, compressed)
                 continue
-            if "429" in err_str and attempt < MAX_RETRIES - 1:
-                time.sleep(5 * (attempt + 1))
-                continue
+            if "429" in es and attempt < MAX_RETRIES-1:
+                time.sleep(5*(attempt+1)); continue
             break
 
     if response is None:
-        return {"error": f"Groq API failed: {str(last_error)}",
-                "block_id": query_meta.get("block_id", "unknown")}
+        return {"error": str(last_error), "block_id": query_meta.get("block_id","?")}
 
     try:
         content = response.choices[0].message.content.strip()
         content = re.sub(r"^```(?:json)?\s*", "", content)
         content = re.sub(r"\s*```$", "", content)
-
         try:
             parsed = repair_json(content)
-        except json.JSONDecodeError as e:
-            print(f"[PARSE ERROR] block={query_meta.get('block_id','?')} | {e}")
-            print(f"  Raw (first 300): {content[:300]}")
+        except Exception as e:
+            print(f"[PARSE ERROR] {query_meta.get('block_id','?')} | {e} | {content[:200]}")
             parsed = {
-                "block_id": query_meta.get("block_id", "parse_error"),
-                "summary": "JSON parse failed.",
-                "root_cause": content[:500],
-                "comparison_to_historical": "",
-                "event_explanations": {},
-                "anomaly_type": query_meta.get("primary_type", "unknown"),
+                "block_id": query_meta.get("block_id","?"), "summary": "Parse failed.",
+                "root_cause": content[:300], "comparison_to_historical": "",
+                "event_explanations": {}, "anomaly_type": query_meta.get("primary_type","unknown"),
                 "confidence": 0.0, "confidence_label": "low",
-                "mitigation_steps": {"high": [], "medium": [], "low": []},
-                "parse_error": True,
+                "mitigation_steps": {"high":[],"medium":[],"low":[]}, "parse_error": True,
             }
 
-        # Enforce anomaly type
-        valid_types = {"duplicate_pattern", "repetition", "missing_events", "high_latency"}
+        valid_types = {"duplicate_pattern","repetition","missing_events","high_latency"}
         if parsed.get("anomaly_type") not in valid_types:
-            parsed["anomaly_type"] = query_meta.get("primary_type", "unknown")
+            parsed["anomaly_type"] = query_meta.get("primary_type","unknown")
 
-        # Sanitise mitigation_steps — never allow empty tiers
-        atype    = parsed.get("anomaly_type", query_meta.get("primary_type", "duplicate_pattern"))
+        atype    = parsed.get("anomaly_type", query_meta.get("primary_type","duplicate_pattern"))
         fallback = FALLBACK_MITIGATIONS.get(atype, FALLBACK_MITIGATIONS["duplicate_pattern"])
         mit      = parsed.get("mitigation_steps")
         if not isinstance(mit, dict):
             parsed["mitigation_steps"] = fallback
         else:
-            for tier in ("high", "medium", "low"):
+            for tier in ("high","medium","low"):
                 cleaned = [x for x in (mit.get(tier) or []) if x and str(x).strip()]
                 mit[tier] = cleaned if cleaned else fallback[tier]
 
-        # Sanitise comparison_to_historical
-        cth = parsed.get("comparison_to_historical", "")
-        if isinstance(cth, (list, dict)) or (isinstance(cth, str) and cth.strip().startswith("[")):
-            avg_lat = int(sum(r["latency"] for r in similar_docs) / max(len(similar_docs), 1))
+        cth = parsed.get("comparison_to_historical","")
+        if isinstance(cth,(list,dict)) or (isinstance(cth,str) and cth.strip().startswith("[")):
+            avg = int(sum(r["latency"] for r in similar_docs)/max(len(similar_docs),1))
             parsed["comparison_to_historical"] = (
-                f"Similar pattern to retrieved cases (avg historical latency: {avg_lat}ms "
-                f"vs this block: {query_meta.get('latency',0)}ms)."
+                f"Similar pattern to retrieved cases (avg historical: {avg}ms vs this block: {latency_ms}ms)."
             )
 
-        # Override confidence with computed value
-        conf, label = compute_confidence(similar_docs, query_doc, query_meta.get("latency", 0))
-        parsed["confidence"]       = conf
-        parsed["confidence_label"] = label
-
         return parsed
-
     except Exception as e:
-        return {"error": f"Response processing failed: {str(e)}",
-                "block_id": query_meta.get("block_id", "unknown")}
+        return {"error": str(e), "block_id": query_meta.get("block_id","?")}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI APP
+# APP
 # ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="HDFS Anomaly Root Cause API", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
 
 
 class AnalyzeRequest(BaseModel):
@@ -443,44 +402,10 @@ class AnalyzeRequest(BaseModel):
 def root():
     return {"status": "ok", "docs": "/docs", "blocks": "/blocks"}
 
-
-@app.post("/analyze")
-def analyze_log(request: AnalyzeRequest):
-    if not request.query and not request.block_id:
-        raise HTTPException(status_code=400, detail="Provide 'query' or 'block_id'.")
-
-    if request.block_id:
-        if request.block_id not in block_lookup:
-            raise HTTPException(status_code=404,
-                detail=f"block_id '{request.block_id}' not found.")
-        q_doc, q_meta = block_lookup[request.block_id]
-        query_str    = build_query_from_doc(q_doc, q_meta)
-        atype_filter = request.anomaly_type_filter or q_meta["primary_type"]
-    else:
-        q_doc        = request.query
-        q_meta       = {"block_id": "external_query",
-                        "primary_type": request.anomaly_type_filter or "unknown",
-                        "anomaly_types": request.anomaly_type_filter or "unknown",
-                        "latency": 0, "total_events": 0}
-        query_str    = request.query
-        atype_filter = request.anomaly_type_filter
-
-    similar = retrieve_similar_anomalies(
-        query=query_str, k=request.k, anomaly_type_filter=atype_filter
-    )
-
-    hist_ctx = "\n\n".join([
-        f"Case {i+1}\n" +
-        compress_historical_case(r["document"], r["block_id"], r["latency"], r["distance"])
-        for i, r in enumerate(similar)
-        if r["block_id"] != q_meta.get("block_id", "")
-    ])
-
-    result = generate_root_cause(q_doc, hist_ctx, q_meta, similar)
-    result["retrieved_block_ids"] = [r["block_id"] for r in similar]
-    result["query_block_id"]      = q_meta.get("block_id", "external_query")
-    return result
-
+@app.get("/health")
+def health():
+    return {"status": "ok", "documents": len(documents),
+            "vectors": collection.count() if collection else 0}
 
 @app.get("/blocks")
 def list_blocks(limit: int = 20, anomaly_type: Optional[str] = None):
@@ -491,11 +416,34 @@ def list_blocks(limit: int = 20, anomaly_type: Optional[str] = None):
     ]
     return {"total": len(blocks), "blocks": blocks[:limit]}
 
+@app.post("/analyze")
+def analyze(request: AnalyzeRequest):
+    if not request.query and not request.block_id:
+        raise HTTPException(400, "Provide 'query' or 'block_id'.")
 
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "documents_loaded": len(documents),
-        "vectors_indexed":  collection.count() if collection else 0,
-    }
+    if request.block_id:
+        if request.block_id not in block_lookup:
+            raise HTTPException(404, f"block_id '{request.block_id}' not found.")
+        q_doc, q_meta = block_lookup[request.block_id]
+        query_str     = build_query_from_doc(q_doc, q_meta)
+        atype_filter  = request.anomaly_type_filter or q_meta["primary_type"]
+    else:
+        q_doc        = request.query
+        q_meta       = {"block_id": "external_query",
+                        "primary_type": request.anomaly_type_filter or "unknown",
+                        "anomaly_types": request.anomaly_type_filter or "unknown",
+                        "latency": 0, "total_events": 0}
+        query_str    = request.query
+        atype_filter = request.anomaly_type_filter
+
+    similar = retrieve_similar(query_str, k=request.k, anomaly_type_filter=atype_filter)
+    hist_ctx = "\n\n".join([
+        f"Case {i+1}\n" + compress_historical_case(r["document"],r["block_id"],r["latency"],r["distance"])
+        for i, r in enumerate(similar)
+        if r["block_id"] != q_meta.get("block_id","")
+    ])
+
+    result = generate_root_cause(q_doc, hist_ctx, q_meta, similar)
+    result["retrieved_block_ids"] = [r["block_id"] for r in similar]
+    result["query_block_id"]      = q_meta.get("block_id","external_query")
+    return result
